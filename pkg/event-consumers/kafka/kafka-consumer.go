@@ -19,12 +19,22 @@ package kafka
 import (
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/Shopify/sarama"
 	"github.com/bsm/sarama-cluster"
 	"github.com/kubeless/kafka-trigger/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
+)
+
+// TODO (wdamron): Integrate retry configuration with Function spec
+const (
+	maxSendRetry = 10
+	minSendRetryDelay = 200 * time.Millisecond
+	maxSendRetryDelay = 5 * time.Second
+	sendRetryDelayMultiplier = 1.5
+	sendRetryDelayJitter = 1.1
 )
 
 var (
@@ -99,13 +109,34 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 					logrus.Errorf("Unable to elaborate request: %v", err)
 				} else {
 					//forward msg to function
-					err = utils.SendMessage(req)
-					if err != nil {
-						logrus.Errorf("Failed to send message to function: %v", err)
-					} else {
-						logrus.Infof("Message has sent to function %s successfully", funcName)
+					var lastDelay time.Duration
+					var retryCount = 0
+					for {
+						if err = utils.SendMessage(req); err != nil {
+							logrus.Errorf("Failed to send message to function: %v", err)
+							var delay time.Duration
+							if lastDelay < minSendRetryDelay {
+								delay = minSendRetryDelay
+							} else {
+								delay = time.Duration(float64(lastDelay) * sendRetryDelayMultiplier * sendRetryDelayJitter)
+							}
+							if delay > maxSendRetryDelay {
+								delay = time.Duration(float64(maxSendRetryDelay) * sendRetryDelayJitter)
+							}
+							time.Sleep(delay)
+							lastDelay = delay
+							retryCount++
+							if retryCount == maxSendRetry {
+								logrus.Errorf("Skipped sending message to function after max attempts: %v", err)
+								consumer.MarkOffset(msg, "")
+								break
+							}
+						} else {
+							logrus.Infof("Message has sent to function %s successfully", funcName)
+							consumer.MarkOffset(msg, "")
+							break
+						}
 					}
-					consumer.MarkOffset(msg, "")
 				}
 			}
 		case ntf, more := <-consumer.Notifications():
