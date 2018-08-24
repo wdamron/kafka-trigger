@@ -123,7 +123,7 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 					logrus.Errorf("Unable to elaborate request: %v", err)
 				} else {
 					//forward msg to function
-					lastDelay := 0.0
+					var lastDelay time.Duration
 					sendAttempts := 0
 					for {
 						if err = utils.SendMessage(req); err != nil {
@@ -146,7 +146,6 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 							logrus.Infof("Delaying for %s before re-sending message to function %s", delay.String(), funcName)
 							time.Sleep(delay)
 							lastDelay = delay
-							sendAttempts++
 						} else {
 							logrus.Infof("Message has sent to function %s successfully", funcName)
 							consumer.MarkOffset(msg, "")
