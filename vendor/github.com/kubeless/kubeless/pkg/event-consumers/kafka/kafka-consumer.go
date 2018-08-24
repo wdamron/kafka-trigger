@@ -108,11 +108,11 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 
 	groupConsumer, err := cluster.NewConsumer(brokersSlice, consumerGroupID, topicsSlice, config)
 	if err != nil {
-		logrus.Fatalf("Failed to start consumer: %v", err)
+		logrus.Fatalf("Failed to start consumer: %v -- broker=%v topic=%s function=%s, consumer-group=%v\n", err, broker, topic, funcName, consumerGroupID)
 	}
 	defer groupConsumer.Close()
 
-	logrus.Infof("Started Kakfa consumer Broker: %v, Topic: %v, Function: %v, consumerID: %v", broker, topic, funcName, consumerGroupID)
+	logrus.Infof("Started Kakfa consumer: broker=%v topic=%s function=%s, consumer-group=%v\n", broker, topic, funcName, consumerGroupID)
 
 	var wg sync.WaitGroup
 	for {
@@ -120,11 +120,12 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 		case partitionConsumer, ok := <-groupConsumer.Partitions():
 			if !ok {
 				wg.Wait()
-				logrus.Fatalf("Group consumer closed unexpectedly: function=%s", funcName)
+				logrus.Fatalf("Group consumer closed unexpectedly: topic=%s function=%s, consumer-group=%v\n", topic, funcName, consumerGroupID)
 				return
 			}
 
 			// Start a separate goroutine per partition to consume messages:
+			logrus.Infof("Started Kafka partition-consumer: topic=%s function=%s partition=%v\n", topic, funcName, partitionConsumer.Partition())
 			wg.Add(1)
 			go createPartitionConsumerProcess(groupConsumer, partitionConsumer, &wg, funcName, ns, clientset, stopchan)
 
@@ -152,14 +153,13 @@ MessageLoop:
 		select {
 		case msg, more := <-consumer.Messages():
 			if !more {
-				logrus.Infof("Partition consumer closed unexpectedly: function=%s topic=%s partition=%v", funcName, consumer.Topic(), consumer.Partition())
+				logrus.Infof("Partition consumer closed unexpectedly: topic=%s function=%s partition=%v\n", consumer.Topic(), funcName, consumer.Partition())
 				return
 			}
-			logrus.Infof("Received Kafka message Partition: %d Offset: %d Key: %s Value: %s ", msg.Partition, msg.Offset, string(msg.Key), string(msg.Value))
-			logrus.Infof("Sending message %s to function %s", msg.Value, funcName)
+			logrus.Infof("Received Kafka message: topic=%s partition=%d offset=%s key=%s value=%s\n", consumer.Topic(), consumer.Partition(), msg.Offset, string(msg.Key), string(msg.Value))
 			req, err := utils.GetHTTPReq(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
 			if err != nil {
-				logrus.Errorf("Unable to elaborate request: %v", err)
+				logrus.Errorf("Unable to elaborate request: %v -- topic=%s function=%s partition=%d offset=%s key=%s\n", err, consumer.Topic(), funcName, consumer.Partition(), msg.Offset, string(msg.Key))
 				continue MessageLoop
 			}
 
@@ -169,11 +169,10 @@ MessageLoop:
 
 			for {
 				if err = utils.SendMessage(req); err != nil {
-
-					logrus.Errorf("Failed to send message to function: %v", err)
+					logrus.Errorf("Failed to send message to function: %v -- topic=%s function=%s partition=%d offset=%s key=%s\n", err, consumer.Topic(), funcName, consumer.Partition(), msg.Offset, string(msg.Key))
 					sendAttempts++
 					if sendAttempts == maxSendAttempts {
-						logrus.Errorf("Skipped sending message to function after %v attempts: %v", sendAttempts, err)
+						logrus.Errorf("Skipped re-sending message to function after %v attempts: %v -- topic=%s function=%s partition=%d offset=%s key=%s\n", sendAttempts, err, consumer.Topic(), funcName, consumer.Partition(), msg.Offset, string(msg.Key))
 						groupConsumer.MarkOffset(msg, "")
 						break
 					}
@@ -187,12 +186,12 @@ MessageLoop:
 					if delay > maxSendRetryDelay {
 						delay = time.Duration(float64(maxSendRetryDelay) * randomDelayJitter())
 					}
-					logrus.Infof("Delaying for %s before re-sending message to function %s", delay.String(), funcName)
+					logrus.Infof("Delaying for %s before re-sending message: topic=%s function=%s partition=%d offset=%s key=%s\n", delay.String(), consumer.Topic(), funcName, consumer.Partition(), msg.Offset, string(msg.Key))
 
 					select {
 					case <-time.After(delay):
 					case <-stopchan:
-						logrus.Infof("Stopping consumer: function=%s topic=%s partition=%v", funcName, consumer.Topic(), msg.Partition)
+						logrus.Infof("Stopping consumer: topic=%s function=%s partition=%d offset=%s key=%s\n", consumer.Topic(), funcName, consumer.Partition(), msg.Offset, string(msg.Key))
 						return
 					}
 
@@ -200,19 +199,19 @@ MessageLoop:
 					continue
 				}
 
-				logrus.Infof("Message has sent to function %s successfully", funcName)
+				logrus.Infof("Sent message to function successfully: topic=%s function=%s partition=%d offset=%s key=%s\n", consumer.Topic(), funcName, consumer.Partition(), msg.Offset, string(msg.Key))
 				groupConsumer.MarkOffset(msg, "")
 				break
 			}
 
 		case err, more := <-consumer.Errors():
 			if more {
-				logrus.Errorf("Error: %s\n", err.Error())
+				logrus.Errorf("Partition-consumer error: %s -- topic=%s function=%s partition=%d\n", err.Error(), consumer.Topic(), funcName, consumer.Partition())
 			}
 		case <-stopchan:
-			logrus.Infof("Stopping consumer: function=%s topic=%s partition=%v", funcName, consumer.Topic(), consumer.Partition())
+			logrus.Infof("Stopping consumer: topic=%s function=%s partition=%v\n", consumer.Topic(), funcName, consumer.Partition())
 			if err := consumer.Close(); err != nil {
-				logrus.Errorf("Error while closing partition consumer for partition %v: %v", consumer.Partition(), err)
+				logrus.Errorf("Error while closing partition-consumer: %v -- topic=%s function=%s partition=%v\n", err, consumer.Topic(), funcName, consumer.Partition())
 			}
 			return
 		}
