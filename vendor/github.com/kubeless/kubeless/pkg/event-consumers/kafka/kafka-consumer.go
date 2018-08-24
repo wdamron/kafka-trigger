@@ -17,14 +17,25 @@ limitations under the License.
 package kafka
 
 import (
+	"math/rand"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/Shopify/sarama"
 	"github.com/bsm/sarama-cluster"
-	"github.com/kubeless/kubeless/pkg/utils"
+	"github.com/kubeless/kafka-trigger/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
+)
+
+// TODO (wdamron): Integrate retry configuration with Function spec
+const (
+	maxSendAttempts          = 10
+	minSendRetryDelay        = 200 * time.Millisecond
+	maxSendAttemptsDelay     = 5 * time.Second
+	sendRetryDelayMultiplier = 1.5
+	sendRetryDelayJitter     = 0.1 // should be a value in the range (0.0, 1.0]
 )
 
 var (
@@ -36,6 +47,10 @@ var (
 )
 
 func init() {
+	if sendRetryDelayJitter <= 0.0 || sendRetryDelayJitter > 1.0 {
+		logrus.Fatal("kafka-consumer: sendRetryDelayJitter should be a value in the range (0.0, 1.0]")
+	}
+
 	stopM = make(map[string](chan struct{}))
 	stoppedM = make(map[string](chan struct{}))
 	consumerM = make(map[string]bool)
@@ -72,6 +87,15 @@ func init() {
 
 }
 
+func randomDelayJitter() float64 {
+	plusminus1 := rand.Float64()*2.0 - 1.0
+	offset := plusminus1 * sendRetryDelayJitter
+	if offset <= -1.0 {
+		offset = -0.9
+	}
+	return 1.0 + offset
+}
+
 // createConsumerProcess gets messages to a Kafka topic from the broker and send the payload to function service
 func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, clientset kubernetes.Interface, stopchan, stoppedchan chan struct{}) {
 	// Init consumer
@@ -93,19 +117,42 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 		case msg, more := <-consumer.Messages():
 			if more {
 				logrus.Infof("Received Kafka message Partition: %d Offset: %d Key: %s Value: %s ", msg.Partition, msg.Offset, string(msg.Key), string(msg.Value))
-				logrus.Infof("Sending message %s to function %s", msg, funcName)
+				logrus.Infof("Sending message %s to function %s", msg.Value, funcName)
 				req, err := utils.GetHTTPReq(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
 				if err != nil {
 					logrus.Errorf("Unable to elaborate request: %v", err)
 				} else {
 					//forward msg to function
-					err = utils.SendMessage(req)
-					if err != nil {
-						logrus.Errorf("Failed to send message to function: %v", err)
-					} else {
-						logrus.Infof("Message has sent to function %s successfully", funcName)
+					lastDelay := 0.0
+					sendAttempts := 0
+					for {
+						if err = utils.SendMessage(req); err != nil {
+							logrus.Errorf("Failed to send message to function: %v", err)
+							sendAttempts++
+							if sendAttempts == maxSendAttempts {
+								logrus.Errorf("Skipped sending message to function after %v attempts: %v", sendAttempts, err)
+								consumer.MarkOffset(msg, "")
+								break
+							}
+							var delay time.Duration
+							if lastDelay < minSendRetryDelay {
+								delay = minSendRetryDelay
+							} else {
+								delay = time.Duration(float64(lastDelay) * sendRetryDelayMultiplier * randomDelayJitter())
+							}
+							if delay > maxSendAttemptsDelay {
+								delay = time.Duration(float64(maxSendAttemptsDelay) * randomDelayJitter())
+							}
+							logrus.Infof("Delaying for %s before re-sending message to function %s", delay.String(), funcName)
+							time.Sleep(delay)
+							lastDelay = delay
+							sendAttempts++
+						} else {
+							logrus.Infof("Message has sent to function %s successfully", funcName)
+							consumer.MarkOffset(msg, "")
+							break
+						}
 					}
-					consumer.MarkOffset(msg, "")
 				}
 			}
 		case ntf, more := <-consumer.Notifications():

@@ -117,7 +117,7 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 		case msg, more := <-consumer.Messages():
 			if more {
 				logrus.Infof("Received Kafka message Partition: %d Offset: %d Key: %s Value: %s ", msg.Partition, msg.Offset, string(msg.Key), string(msg.Value))
-				logrus.Infof("Sending message %s to function %s", msg, funcName)
+				logrus.Infof("Sending message %s to function %s", msg.Value, funcName)
 				req, err := utils.GetHTTPReq(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
 				if err != nil {
 					logrus.Errorf("Unable to elaborate request: %v", err)
