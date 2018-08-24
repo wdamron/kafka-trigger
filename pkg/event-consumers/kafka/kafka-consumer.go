@@ -33,7 +33,7 @@ import (
 const (
 	maxSendAttempts          = 10
 	minSendRetryDelay        = 200 * time.Millisecond
-	maxSendAttemptsDelay     = 5 * time.Second
+	maxSendRetryDelay        = 5 * time.Second
 	sendRetryDelayMultiplier = 1.5
 	sendRetryDelayJitter     = 0.1 // should be a value in the range (0.0, 1.0]
 )
@@ -125,6 +125,8 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 					//forward msg to function
 					var lastDelay time.Duration
 					sendAttempts := 0
+
+				RetryLoop:
 					for {
 						if err = utils.SendMessage(req); err != nil {
 							logrus.Errorf("Failed to send message to function: %v", err)
@@ -132,7 +134,7 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 							if sendAttempts == maxSendAttempts {
 								logrus.Errorf("Skipped sending message to function after %v attempts: %v", sendAttempts, err)
 								consumer.MarkOffset(msg, "")
-								break
+								break RetryLoop
 							}
 							var delay time.Duration
 							if lastDelay < minSendRetryDelay {
@@ -140,16 +142,33 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 							} else {
 								delay = time.Duration(float64(lastDelay) * sendRetryDelayMultiplier * randomDelayJitter())
 							}
-							if delay > maxSendAttemptsDelay {
-								delay = time.Duration(float64(maxSendAttemptsDelay) * randomDelayJitter())
+							if delay > maxSendRetryDelay {
+								delay = time.Duration(float64(maxSendRetryDelay) * randomDelayJitter())
 							}
 							logrus.Infof("Delaying for %s before re-sending message to function %s", delay.String(), funcName)
-							time.Sleep(delay)
+							select {
+							case ntf, more := <-consumer.Notifications():
+								if more {
+									logrus.Infof("Rebalanced: %+v\n", ntf)
+									partitionAssigned := false
+									for _, topicPartition := range ntf.Current[topic] {
+										if topicPartition == msg.Partition {
+											partitionAssigned = true
+											break
+										}
+									}
+									if !partitionAssigned {
+										logrus.Infof("Skipped sending message to function after partition was reassigned: partition=%v, offset=%v", msg.Partition, msg.Offset)
+										break RetryLoop
+									}
+								}
+							case <-time.After(delay):
+							}
 							lastDelay = delay
 						} else {
 							logrus.Infof("Message has sent to function %s successfully", funcName)
 							consumer.MarkOffset(msg, "")
-							break
+							break RetryLoop
 						}
 					}
 				}
