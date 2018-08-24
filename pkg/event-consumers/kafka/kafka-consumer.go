@@ -17,6 +17,7 @@ limitations under the License.
 package kafka
 
 import (
+	"math/rand"
 	"os"
 	"strconv"
 	"time"
@@ -30,11 +31,11 @@ import (
 
 // TODO (wdamron): Integrate retry configuration with Function spec
 const (
-	maxSendRetry = 10
-	minSendRetryDelay = 200 * time.Millisecond
-	maxSendRetryDelay = 5 * time.Second
+	maxSendAttempts          = 10
+	minSendRetryDelay        = 200 * time.Millisecond
+	maxSendAttemptsDelay     = 5 * time.Second
 	sendRetryDelayMultiplier = 1.5
-	sendRetryDelayJitter = 1.1
+	sendRetryDelayJitter     = 0.1 // should be a value in the range (0.0, 1.0]
 )
 
 var (
@@ -46,6 +47,10 @@ var (
 )
 
 func init() {
+	if sendRetryDelayJitter <= 0.0 || sendRetryDelayJitter > 1.0 {
+		logrus.Fatal("kafka-consumer: sendRetryDelayJitter should be a value in the range (0.0, 1.0]")
+	}
+
 	stopM = make(map[string](chan struct{}))
 	stoppedM = make(map[string](chan struct{}))
 	consumerM = make(map[string]bool)
@@ -82,6 +87,15 @@ func init() {
 
 }
 
+func randomDelayJitter() float64 {
+	plusminus1 := rand.Float64()*2.0 - 1.0
+	offset := plusminus1 * sendRetryDelayJitter
+	if offset <= -1.0 {
+		offset = -0.9
+	}
+	return 1.0 + offset
+}
+
 // createConsumerProcess gets messages to a Kafka topic from the broker and send the payload to function service
 func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, clientset kubernetes.Interface, stopchan, stoppedchan chan struct{}) {
 	// Init consumer
@@ -109,28 +123,30 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 					logrus.Errorf("Unable to elaborate request: %v", err)
 				} else {
 					//forward msg to function
-					var lastDelay time.Duration
-					var retryCount = 0
+					lastDelay := 0.0
+					sendAttempts := 0
 					for {
 						if err = utils.SendMessage(req); err != nil {
 							logrus.Errorf("Failed to send message to function: %v", err)
+							sendAttempts++
+							if sendAttempts == maxSendAttempts {
+								logrus.Errorf("Skipped sending message to function after %v attempts: %v", sendAttempts, err)
+								consumer.MarkOffset(msg, "")
+								break
+							}
 							var delay time.Duration
 							if lastDelay < minSendRetryDelay {
 								delay = minSendRetryDelay
 							} else {
-								delay = time.Duration(float64(lastDelay) * sendRetryDelayMultiplier * sendRetryDelayJitter)
+								delay = time.Duration(float64(lastDelay) * sendRetryDelayMultiplier * randomDelayJitter())
 							}
-							if delay > maxSendRetryDelay {
-								delay = time.Duration(float64(maxSendRetryDelay) * sendRetryDelayJitter)
+							if delay > maxSendAttemptsDelay {
+								delay = time.Duration(float64(maxSendAttemptsDelay) * randomDelayJitter())
 							}
+							logrus.Infof("Delaying for %s before re-sending message to function %s", delay.String(), funcName)
 							time.Sleep(delay)
 							lastDelay = delay
-							retryCount++
-							if retryCount == maxSendRetry {
-								logrus.Errorf("Skipped sending message to function after max attempts: %v", err)
-								consumer.MarkOffset(msg, "")
-								break
-							}
+							sendAttempts++
 						} else {
 							logrus.Infof("Message has sent to function %s successfully", funcName)
 							consumer.MarkOffset(msg, "")

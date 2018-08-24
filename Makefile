@@ -41,11 +41,11 @@ kafka-zookeeper.yaml: kafka-zookeeper.jsonnet
 
 kafka-zookeeper-openshift.yaml: kafka-zookeeper-openshift.jsonnet
 
-docker/kafka-controller: kafka-controller-build
-	cp $(BUNDLES)/kubeless_$(OS)-$(ARCH)/kafka-controller $@
-
 kafka-controller-build:
 	./script/kafka-controller.sh -os=$(OS) -arch=$(ARCH)
+
+docker/kafka-controller: kafka-controller-build
+	cp $(BUNDLES)/kubeless_$(OS)-$(ARCH)/kafka-controller $@
 
 kafka-controller-image: docker/kafka-controller
 	$(DOCKER) build -t $(KAFKA_CONTROLLER_IMAGE) $<
