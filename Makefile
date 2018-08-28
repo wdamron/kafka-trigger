@@ -4,7 +4,10 @@ GOFMT = gofmt
 KUBECFG = kubecfg
 DOCKER = docker
 CONTROLLER_IMAGE = kubeless-controller-manager:latest
-KAFKA_CONTROLLER_IMAGE = kafka-trigger-controller:latest
+IMAGE_NAME = kafka-trigger-controller
+IMAGE_BRANCH = $$(git branch | grep \* | cut -d ' ' -f2)
+IMAGE_VERSION = $$(git rev-parse --short HEAD)
+IMAGE = $(IMAGE_NAME):$(IMAGE_BRANCH)-$(IMAGE_VERSION)
 OS = linux
 ARCH = amd64
 BUNDLES = bundles
@@ -44,11 +47,12 @@ kafka-zookeeper-openshift.yaml: kafka-zookeeper-openshift.jsonnet
 kafka-controller-build:
 	./script/kafka-controller.sh -os=$(OS) -arch=$(ARCH)
 
-docker/kafka-controller: kafka-controller-build
-	cp $(BUNDLES)/kubeless_$(OS)-$(ARCH)/kafka-controller $@
+image: kafka-controller-build
+	cp $(BUNDLES)/kubeless_$(OS)-$(ARCH)/kafka-controller docker/kafka-controller
+	$(DOCKER) build -t $(IMAGE) docker/kafka-controller
 
-kafka-controller-image: docker/kafka-controller
-	$(DOCKER) build -t $(KAFKA_CONTROLLER_IMAGE) $<
+push: image
+	$(DOCKER) push $(IMAGE)
 
 update:
 	./hack/update-codegen.sh
