@@ -37,6 +37,9 @@ BUILD_FLAGS=(-ldflags="-w -X github.com/kubeless/kubeless/pkg/version.Version=${
 # Get rid of existing binaries
 rm -rf bundles/kubeless*
 
+# Hack
+cp pkg/event-consumers/kafka/kafka-consumer.go vendor/github.com/kubeless/kubeless/pkg/event-consumers/kafka/kafka-consumer.go
+
 # Build kafka-controller
 gox "${OS_PLATFORM_ARG[@]}" "${OS_ARCH_ARG[@]}" \
     -output="bundles/kubeless_{{.OS}}-{{.Arch}}/kafka-controller" \
