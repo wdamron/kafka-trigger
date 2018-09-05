@@ -20,6 +20,7 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -151,6 +152,8 @@ func createPartitionConsumerProcess(
 	defer wg.Done()
 
 	headerBuffer := make([]byte, 0, 1024*32)
+	replacer := strings.NewReplacer("\r", "", "\n", "")
+	topic := consumer.Topic()
 
 	// Consume messages, wait for signal to stopchan to exit
 MessageLoop:
@@ -178,10 +181,21 @@ MessageLoop:
 			} else {
 				logrus.Infof("[%s/%d/%d] Received Kafka message: function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, funcName, string(msg.Key))
 			}
+
 			req, err := utils.GetHTTPReq(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
 			if err != nil {
 				logrus.Errorf("[%s/%d/%d] Unable to elaborate request: function=%s key=%s err=%s", consumer.Topic(), consumer.Partition(), msg.Offset, funcName, string(msg.Key), err)
 				continue MessageLoop
+			}
+
+			req.Header.Add("X-Kafka-Topic", topic)
+			req.Header.Add("X-Kafka-Partition", strconv.Itoa(int(msg.Partition)))
+			req.Header.Add("X-Kafka-Offset", strconv.Itoa(int(msg.Offset)))
+			req.Header.Add("X-Kafka-Message-Key", replacer.Replace(string(msg.Key)))
+			if len(msg.Headers) != 0 {
+				for _, hdr := range msg.Headers {
+					req.Header.Add("X-Attr-"+string(hdr.Key), replacer.Replace(string(hdr.Value)))
+				}
 			}
 
 			//forward msg to function

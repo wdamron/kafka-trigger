@@ -153,6 +153,7 @@ func createPartitionConsumerProcess(
 
 	headerBuffer := make([]byte, 0, 1024*32)
 	replacer := strings.NewReplacer("\r", "", "\n", "")
+	topic := consumer.Topic()
 
 	// Consume messages, wait for signal to stopchan to exit
 MessageLoop:
@@ -187,10 +188,13 @@ MessageLoop:
 				continue MessageLoop
 			}
 
+			req.Header.Add("X-Kafka-Topic", topic)
+			req.Header.Add("X-Kafka-Partition", strconv.Itoa(int(msg.Partition)))
+			req.Header.Add("X-Kafka-Offset", strconv.Itoa(int(msg.Offset)))
+			req.Header.Add("X-Kafka-Message-Key", replacer.Replace(string(msg.Key)))
 			if len(msg.Headers) != 0 {
-				reqHeader := req.Header
 				for _, hdr := range msg.Headers {
-					reqHeader.Add(string(hdr.Key), replacer.Replace(string(hdr.Value)))
+					req.Header.Add("X-Attr-"+string(hdr.Key), replacer.Replace(string(hdr.Value)))
 				}
 			}
 
