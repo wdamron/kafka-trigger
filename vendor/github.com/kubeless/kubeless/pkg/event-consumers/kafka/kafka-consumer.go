@@ -69,6 +69,7 @@ func init() {
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
 	config.Consumer.Return.Errors = true
 	config.Group.Mode = cluster.ConsumerModePartitions
+	config.Version = sarama.V0_11_0_0 // Headers are only supported in version 0.11+; see https://github.com/Shopify/sarama/blob/35324cf48e33d8260e1c7c18854465a904ade249/consumer.go#L19
 
 	var err error
 
@@ -161,15 +162,19 @@ MessageLoop:
 				return
 			}
 			if logHeaders {
-				for _, hdr := range msg.Headers {
-					headerBuffer = append(headerBuffer, hdr.Key...)
-					headerBuffer = append(headerBuffer, '=')
-					headerBuffer = append(headerBuffer, hdr.Value...)
-					headerBuffer = append(headerBuffer, ' ')
+				if len(msg.Headers) == 0 {
+					const none = "(none)"
+					headerBuffer = append(headerBuffer, none...)
+				} else {
+					for _, hdr := range msg.Headers {
+						headerBuffer = append(headerBuffer, hdr.Key...)
+						headerBuffer = append(headerBuffer, '=')
+						headerBuffer = append(headerBuffer, hdr.Value...)
+						headerBuffer = append(headerBuffer, ' ')
+					}
 				}
-
 				logrus.Infof("[%s/%d/%d] Received Kafka message: function=%s key=%s headers: %s", consumer.Topic(), consumer.Partition(), msg.Offset, funcName, string(msg.Key), string(headerBuffer))
-				headerBuffer = headerBuffer[:0]
+				headerBuffer = headerBuffer[: 0 : 1024*32]
 			} else {
 				logrus.Infof("[%s/%d/%d] Received Kafka message: function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, funcName, string(msg.Key))
 			}

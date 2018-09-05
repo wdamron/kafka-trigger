@@ -69,6 +69,7 @@ func init() {
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
 	config.Consumer.Return.Errors = true
 	config.Group.Mode = cluster.ConsumerModePartitions
+	config.Version = sarama.V0_11_0_0 // Headers are only supported in version 0.11+; see https://github.com/Shopify/sarama/blob/35324cf48e33d8260e1c7c18854465a904ade249/consumer.go#L19
 
 	var err error
 
