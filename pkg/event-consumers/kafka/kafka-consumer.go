@@ -109,6 +109,8 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 	brokersSlice := []string{broker}
 	topicsSlice := []string{topic}
 
+	nextThreadId := uint64(0)
+
 	groupConsumer, err := cluster.NewConsumer(brokersSlice, consumerGroupID, topicsSlice, config)
 	if err != nil {
 		logrus.Infof("[%s] Failed to start group-consumer: broker=%v consumer-group=%s function=%s err=%v", topic, broker, consumerGroupID, funcName, err)
@@ -129,9 +131,10 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 			}
 
 			// Start a separate goroutine per partition to consume messages:
-			logrus.Infof("[%s/%d] Started Kafka partition-consumer: consumer-group=%s function=%s", topic, partitionConsumer.Partition(), consumerGroupID, funcName)
+			logrus.Infof("[%s/%d] Started Kafka partition-consumer: consumer-group=%s thread=%v function=%s", topic, partitionConsumer.Partition(), consumerGroupID, nextThreadId, funcName)
 			wg.Add(1)
-			go createPartitionConsumerProcess(groupConsumer, partitionConsumer, &wg, funcName, ns, clientset, stopchan)
+			go createPartitionConsumerProcess(groupConsumer, partitionConsumer, &wg, nextThreadId, funcName, ns, clientset, stopchan)
+			nextThreadId++
 
 		case <-stopchan:
 			logrus.Infof("[%s] Waiting for all partition-consumers to close: consumer-group=%s function=%s", topic, consumerGroupID, funcName)
@@ -145,6 +148,7 @@ func createPartitionConsumerProcess(
 	groupConsumer *cluster.Consumer,
 	consumer cluster.PartitionConsumer,
 	wg *sync.WaitGroup,
+	threadId uint64,
 	funcName, ns string,
 	clientset kubernetes.Interface,
 	stopchan chan struct{}) {
@@ -161,7 +165,7 @@ MessageLoop:
 		select {
 		case msg, more := <-consumer.Messages():
 			if !more {
-				logrus.Infof("[%s/%d] Partition consumer closed: function=%s", consumer.Topic(), consumer.Partition(), funcName)
+				logrus.Infof("[%s/%d] Partition-consumer closed: thread=%v function=%s", consumer.Topic(), consumer.Partition(), threadId, funcName)
 				return
 			}
 			if logHeaders {
@@ -176,15 +180,15 @@ MessageLoop:
 						headerBuffer = append(headerBuffer, ' ')
 					}
 				}
-				logrus.Infof("[%s/%d/%d] Received Kafka message: function=%s key=%s headers: %s", consumer.Topic(), consumer.Partition(), msg.Offset, funcName, string(msg.Key), string(headerBuffer))
+				logrus.Infof("[%s/%d/%d] Received Kafka message: thread=%v function=%s key=%s headers: %s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), string(headerBuffer))
 				headerBuffer = headerBuffer[: 0 : 1024*32]
 			} else {
-				logrus.Infof("[%s/%d/%d] Received Kafka message: function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, funcName, string(msg.Key))
+				logrus.Infof("[%s/%d/%d] Received Kafka message: thread=%v function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key))
 			}
 
 			req, err := utils.GetHTTPReq(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
 			if err != nil {
-				logrus.Errorf("[%s/%d/%d] Unable to elaborate request: function=%s key=%s err=%s", consumer.Topic(), consumer.Partition(), msg.Offset, funcName, string(msg.Key), err)
+				logrus.Errorf("[%s/%d/%d] Unable to elaborate request: thread=%v function=%s key=%s err=%s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), err)
 				continue MessageLoop
 			}
 
@@ -204,10 +208,10 @@ MessageLoop:
 
 			for {
 				if err = utils.SendMessage(req); err != nil {
-					logrus.Errorf("[%s/%d/%d] Failed to send message to function: function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, funcName, string(msg.Key), err)
+					logrus.Errorf("[%s/%d/%d] Failed to send message to function: thread=%v function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), err)
 					sendAttempts++
 					if sendAttempts == maxSendAttempts {
-						logrus.Errorf("[%s/%d/%d] Skipped sending message to function after %v attempts: function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, sendAttempts, funcName, string(msg.Key), err)
+						logrus.Errorf("[%s/%d/%d] Skipped sending message to function after %v attempts: thread=%v function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, sendAttempts, threadId, funcName, string(msg.Key), err)
 						groupConsumer.MarkOffset(msg, "")
 						break
 					}
@@ -221,12 +225,12 @@ MessageLoop:
 					if delay > maxSendRetryDelay {
 						delay = time.Duration(float64(maxSendRetryDelay) * randomDelayJitter())
 					}
-					logrus.Infof("[%s/%d/%d] Delaying for %s before re-sending message: function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, delay.String(), funcName, string(msg.Key))
+					logrus.Infof("[%s/%d/%d] Delaying for %s before re-sending message: thread=%v function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, delay.String(), threadId, funcName, string(msg.Key))
 
 					select {
 					case <-time.After(delay):
 					case <-stopchan:
-						logrus.Infof("[%s/%d/%d] Stopping consumer: function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, funcName)
+						logrus.Infof("[%s/%d/%d] Stopping consumer: thread=%v function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName)
 						return
 					}
 
@@ -234,19 +238,19 @@ MessageLoop:
 					continue
 				}
 
-				logrus.Infof("[%s/%d/%d] Sent message to function successfully: function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, funcName, string(msg.Key))
+				logrus.Infof("[%s/%d/%d] Sent message to function successfully: thread=%v function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key))
 				groupConsumer.MarkOffset(msg, "")
 				break
 			}
 
 		case err, more := <-consumer.Errors():
 			if more {
-				logrus.Errorf("[%s/%d] Partition-consumer error: function=%s err=%v", consumer.Topic(), consumer.Partition(), funcName, err)
+				logrus.Errorf("[%s/%d] Partition-consumer error: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), threadId, funcName, err)
 			}
 		case <-stopchan:
-			logrus.Infof("[%s/%d] Stopping partition-consumer: function=%s", consumer.Topic(), consumer.Partition(), funcName)
+			logrus.Infof("[%s/%d] Stopping partition-consumer: thread=%v function=%s", consumer.Topic(), consumer.Partition(), threadId, funcName)
 			if err := consumer.Close(); err != nil {
-				logrus.Errorf("[%s/%d] Error while closing partition-consumer: function=%s err=%v", consumer.Topic(), consumer.Partition(), funcName, err)
+				logrus.Errorf("[%s/%d] Error while closing partition-consumer: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), threadId, funcName, err)
 			}
 			return
 		}
