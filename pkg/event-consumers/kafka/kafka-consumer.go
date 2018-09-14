@@ -17,7 +17,10 @@ limitations under the License.
 package kafka
 
 import (
+	"io"
+	"io/ioutil"
 	"math/rand"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -68,6 +71,7 @@ func init() {
 	config = cluster.NewConfig()
 
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
+	config.Consumer.Offsets.CommitInterval = time.Second
 	config.Consumer.Return.Errors = true
 	config.Group.Mode = cluster.ConsumerModePartitions
 	config.Version = sarama.V0_11_0_0 // Headers are only supported in version 0.11+; see https://github.com/Shopify/sarama/blob/35324cf48e33d8260e1c7c18854465a904ade249/consumer.go#L19
@@ -155,6 +159,7 @@ func createPartitionConsumerProcess(
 
 	defer wg.Done()
 
+	httpClient := newHTTPClient()
 	headerBuffer := make([]byte, 0, 1024*32)
 	replacer := strings.NewReplacer("\r", "", "\n", "")
 	topic := consumer.Topic()
@@ -207,7 +212,7 @@ MessageLoop:
 			sendAttempts := 0
 
 			for {
-				if err = utils.SendMessage(req); err != nil {
+				if err = sendMessage(httpClient, req); err != nil {
 					logrus.Errorf("[%s/%d/%d] Failed to send message to function: thread=%v function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), err)
 					sendAttempts++
 					if sendAttempts == maxSendAttempts {
@@ -291,4 +296,31 @@ func DeleteKafkaConsumer(triggerObjName, funcName, ns, topic string) error {
 
 func generateUniqueConsumerGroupID(triggerObjName, funcName, ns, topic string) string {
 	return ns + "_" + triggerObjName + "_" + funcName + "_" + topic
+}
+
+func newHTTPClient() *http.Client {
+	// Customize the Transport to have larger connection pool
+	defaultRoundTripper := http.DefaultTransport
+	defaultTransportPointer, ok := defaultRoundTripper.(*http.Transport)
+	if !ok {
+		panic(fmt.Sprintf("defaultRoundTripper not an *http.Transport"))
+	}
+	defaultTransport := *defaultTransportPointer // dereference it to get a copy of the struct that the pointer points to
+	defaultTransport.MaxIdleConns = 100
+	defaultTransport.MaxIdleConnsPerHost = 100
+
+	return &http.Client{Transport: &defaultTransport}
+}
+
+func sendMessage(client *http.Client, req *http.Request) error {
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	io.Copy(ioutil.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Error: received error code %d: %s", resp.StatusCode, resp.Status)
+	}
+	return nil
 }
