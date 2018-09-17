@@ -17,7 +17,11 @@ limitations under the License.
 package kafka
 
 import (
+	"fmt"
+	"io"
+	"io/ioutil"
 	"math/rand"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -26,7 +30,7 @@ import (
 
 	"github.com/Shopify/sarama"
 	"github.com/bsm/sarama-cluster"
-	"github.com/kubeless/kafka-trigger/pkg/utils"
+	kubelessutil "github.com/kubeless/kubeless/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
 )
@@ -38,6 +42,8 @@ const (
 	maxSendRetryDelay        = 5 * time.Second
 	sendRetryDelayMultiplier = 1.5
 	sendRetryDelayJitter     = 0.1 // should be a value in the range (0.0, 1.0]
+
+	funcPort = 8080
 
 	logHeaders = true
 )
@@ -68,6 +74,7 @@ func init() {
 	config = cluster.NewConfig()
 
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
+	config.Consumer.Offsets.CommitInterval = time.Second
 	config.Consumer.Return.Errors = true
 	config.Group.Mode = cluster.ConsumerModePartitions
 	config.Version = sarama.V0_11_0_0 // Headers are only supported in version 0.11+; see https://github.com/Shopify/sarama/blob/35324cf48e33d8260e1c7c18854465a904ade249/consumer.go#L19
@@ -155,6 +162,7 @@ func createPartitionConsumerProcess(
 
 	defer wg.Done()
 
+	httpClient := newHTTPClient()
 	headerBuffer := make([]byte, 0, 1024*32)
 	replacer := strings.NewReplacer("\r", "", "\n", "")
 	topic := consumer.Topic()
@@ -186,7 +194,7 @@ MessageLoop:
 				logrus.Infof("[%s/%d/%d] Received Kafka message: thread=%v function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key))
 			}
 
-			req, err := utils.GetHTTPReq(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
+			req, err := buildRequest(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
 			if err != nil {
 				logrus.Errorf("[%s/%d/%d] Unable to elaborate request: thread=%v function=%s key=%s err=%s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), err)
 				continue MessageLoop
@@ -207,7 +215,7 @@ MessageLoop:
 			sendAttempts := 0
 
 			for {
-				if err = utils.SendMessage(req); err != nil {
+				if err = sendMessage(httpClient, req); err != nil {
 					logrus.Errorf("[%s/%d/%d] Failed to send message to function: thread=%v function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), err)
 					sendAttempts++
 					if sendAttempts == maxSendAttempts {
@@ -291,4 +299,50 @@ func DeleteKafkaConsumer(triggerObjName, funcName, ns, topic string) error {
 
 func generateUniqueConsumerGroupID(triggerObjName, funcName, ns, topic string) string {
 	return ns + "_" + triggerObjName + "_" + funcName + "_" + topic
+}
+
+func newHTTPClient() *http.Client {
+	// Customize the Transport to have larger connection pool
+	defaultRoundTripper := http.DefaultTransport
+	defaultTransportPointer, ok := defaultRoundTripper.(*http.Transport)
+	if !ok {
+		panic(fmt.Sprintf("defaultRoundTripper not an *http.Transport"))
+	}
+	defaultTransport := *defaultTransportPointer // dereference it to get a copy of the struct that the pointer points to
+	defaultTransport.MaxIdleConns = 100
+	defaultTransport.MaxIdleConnsPerHost = 100
+
+	return &http.Client{Transport: &defaultTransport}
+}
+
+// GetHTTPReq returns the http request object that can be used to send a event with payload to function service
+func buildRequest(clientset kubernetes.Interface, funcName, namespace, eventNamespace, method, body string) (*http.Request, error) {
+	req, err := http.NewRequest(method, fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", funcName, namespace, funcPort), strings.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("Unable to create request %v", err)
+	}
+	timestamp := time.Now().UTC()
+	eventID, err := kubelessutil.GetRandString(11)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to create a event-ID %v", err)
+	}
+	req.Header.Add("event-id", eventID)
+	req.Header.Add("event-time", timestamp.String())
+	req.Header.Add("event-namespace", eventNamespace)
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("event-type", "application/json")
+	return req, nil
+}
+
+func sendMessage(client *http.Client, req *http.Request) error {
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	io.Copy(ioutil.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Error: received error code %d: %s", resp.StatusCode, resp.Status)
+	}
+	return nil
 }

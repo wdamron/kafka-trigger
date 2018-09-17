@@ -17,6 +17,7 @@ limitations under the License.
 package kafka
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
@@ -29,7 +30,7 @@ import (
 
 	"github.com/Shopify/sarama"
 	"github.com/bsm/sarama-cluster"
-	"github.com/kubeless/kafka-trigger/pkg/utils"
+	kubelessutil "github.com/kubeless/kubeless/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
 )
@@ -41,6 +42,8 @@ const (
 	maxSendRetryDelay        = 5 * time.Second
 	sendRetryDelayMultiplier = 1.5
 	sendRetryDelayJitter     = 0.1 // should be a value in the range (0.0, 1.0]
+
+	funcPort = 8080
 
 	logHeaders = true
 )
@@ -191,7 +194,7 @@ MessageLoop:
 				logrus.Infof("[%s/%d/%d] Received Kafka message: thread=%v function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key))
 			}
 
-			req, err := utils.GetHTTPReq(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
+			req, err := buildRequest(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
 			if err != nil {
 				logrus.Errorf("[%s/%d/%d] Unable to elaborate request: thread=%v function=%s key=%s err=%s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), err)
 				continue MessageLoop
@@ -310,6 +313,25 @@ func newHTTPClient() *http.Client {
 	defaultTransport.MaxIdleConnsPerHost = 100
 
 	return &http.Client{Transport: &defaultTransport}
+}
+
+// GetHTTPReq returns the http request object that can be used to send a event with payload to function service
+func buildRequest(clientset kubernetes.Interface, funcName, namespace, eventNamespace, method, body string) (*http.Request, error) {
+	req, err := http.NewRequest(method, fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", funcName, namespace, funcPort), strings.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("Unable to create request %v", err)
+	}
+	timestamp := time.Now().UTC()
+	eventID, err := kubelessutil.GetRandString(11)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to create a event-ID %v", err)
+	}
+	req.Header.Add("event-id", eventID)
+	req.Header.Add("event-time", timestamp.String())
+	req.Header.Add("event-namespace", eventNamespace)
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("event-type", "application/json")
+	return req, nil
 }
 
 func sendMessage(client *http.Client, req *http.Request) error {
