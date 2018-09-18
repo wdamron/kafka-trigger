@@ -17,6 +17,7 @@ limitations under the License.
 package kafka
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -42,6 +43,8 @@ const (
 	maxSendRetryDelay        = 5 * time.Second
 	sendRetryDelayMultiplier = 1.5
 	sendRetryDelayJitter     = 0.1 // should be a value in the range (0.0, 1.0]
+
+	requestTimeout = 30 * time.Minute
 
 	funcPort = 8080
 
@@ -73,6 +76,7 @@ func init() {
 	}
 	config = cluster.NewConfig()
 
+	config.Consumer.MaxProcessingTime = requestTimeout
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
 	config.Consumer.Offsets.CommitInterval = time.Second
 	config.Consumer.Return.Errors = true
@@ -160,12 +164,21 @@ func createPartitionConsumerProcess(
 	clientset kubernetes.Interface,
 	stopchan chan struct{}) {
 
-	defer wg.Done()
-
 	httpClient := newHTTPClient()
 	headerBuffer := make([]byte, 0, 1024*32)
+	rootContext, cancelRoot := context.WithCancel(context.Background())
 	replacer := strings.NewReplacer("\r", "", "\n", "")
 	topic := consumer.Topic()
+
+	defer wg.Done()
+	defer cancelRoot()
+
+	go func() {
+		select {
+		case <-stopchan:
+			cancelRoot()
+		}
+	}()
 
 	// Consume messages, wait for signal to stopchan to exit
 MessageLoop:
@@ -204,18 +217,21 @@ MessageLoop:
 			req.Header.Add("X-Kafka-Partition", strconv.Itoa(int(msg.Partition)))
 			req.Header.Add("X-Kafka-Offset", strconv.Itoa(int(msg.Offset)))
 			req.Header.Add("X-Kafka-Message-Key", replacer.Replace(string(msg.Key)))
+			req.Header.Add("X-Kafka-Timestamp", msg.Timestamp.Format(time.RFC3339Nano))
 			if len(msg.Headers) != 0 {
 				for _, hdr := range msg.Headers {
 					req.Header.Add("X-Attr-"+string(hdr.Key), replacer.Replace(string(hdr.Value)))
 				}
 			}
 
-			//forward msg to function
 			var lastDelay time.Duration
 			sendAttempts := 0
 
 			for {
-				if err = sendMessage(httpClient, req); err != nil {
+				ctx, cancel := context.WithTimeout(rootContext, requestTimeout)
+				err := sendMessage(httpClient, req.WithContext(ctx))
+				cancel()
+				if err != nil {
 					logrus.Errorf("[%s/%d/%d] Failed to send message to function: thread=%v function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), err)
 					sendAttempts++
 					if sendAttempts == maxSendAttempts {
@@ -237,7 +253,7 @@ MessageLoop:
 
 					select {
 					case <-time.After(delay):
-					case <-stopchan:
+					case <-ctx.Done():
 						logrus.Infof("[%s/%d/%d] Stopping consumer: thread=%v function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName)
 						return
 					}
@@ -255,7 +271,7 @@ MessageLoop:
 			if more {
 				logrus.Errorf("[%s/%d] Partition-consumer error: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), threadId, funcName, err)
 			}
-		case <-stopchan:
+		case <-rootContext.Done():
 			logrus.Infof("[%s/%d] Stopping partition-consumer: thread=%v function=%s", consumer.Topic(), consumer.Partition(), threadId, funcName)
 			if err := consumer.Close(); err != nil {
 				logrus.Errorf("[%s/%d] Error while closing partition-consumer: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), threadId, funcName, err)
