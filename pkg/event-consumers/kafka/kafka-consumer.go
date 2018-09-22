@@ -59,6 +59,8 @@ var (
 
 	brokers string
 	config  *cluster.Config
+
+	UserAgent = "" // filled in during linking
 )
 
 func init() {
@@ -132,6 +134,8 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 
 	logrus.Infof("[%s] Started Kakfa group-consumer: broker=%v consumer-group=%s function=%s, ", topic, broker, consumerGroupID, funcName)
 
+	httpClient := newHTTPClient()
+
 	var wg sync.WaitGroup
 	assignments := groupConsumer.Partitions()
 	for {
@@ -146,7 +150,7 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 			// Start a separate goroutine per partition to consume messages:
 			logrus.Infof("[%s/%d] Started Kafka partition-consumer: consumer-group=%s thread=%v function=%s", topic, partitionConsumer.Partition(), consumerGroupID, nextThreadId, funcName)
 			wg.Add(1)
-			go createPartitionConsumerProcess(groupConsumer, partitionConsumer, &wg, nextThreadId, funcName, ns, clientset, stopchan)
+			go createPartitionConsumerProcess(groupConsumer, partitionConsumer, &wg, nextThreadId, funcName, ns, clientset, httpClient, stopchan)
 			nextThreadId++
 
 		case <-stopchan:
@@ -164,9 +168,9 @@ func createPartitionConsumerProcess(
 	threadId uint64,
 	funcName, ns string,
 	clientset kubernetes.Interface,
+	httpClient *http.Client,
 	stopchan chan struct{}) {
 
-	httpClient := newHTTPClient()
 	headerBuffer := make([]byte, 0, 1024*32)
 	rootContext, cancelRoot := context.WithCancel(context.Background())
 	replacer := strings.NewReplacer("\r", "", "\n", "")
@@ -228,16 +232,21 @@ MessageLoop:
 
 			var lastDelay time.Duration
 			sendAttempts := 0
+			startTime := time.Now()
 
 			for {
+				reqStart := time.Now()
 				ctx, cancel := context.WithTimeout(rootContext, requestTimeout)
 				err := sendMessage(httpClient, req.WithContext(ctx))
 				cancel()
+				reqEnd := time.Now()
 				if err != nil {
-					logrus.Errorf("[%s/%d/%d] Failed to send message to function: thread=%v function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), err)
 					sendAttempts++
+					logrus.Errorf("[%s/%d/%d] Failed to send message to function: thread=%v function=%s key=%s duration=%s total-duration=%s attempts=%v err=%v",
+						consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), reqEnd.Sub(reqStart), reqEnd.Sub(startTime), sendAttempts, err)
 					if sendAttempts == maxSendAttempts {
-						logrus.Errorf("[%s/%d/%d] Skipped sending message to function after %v attempts: thread=%v function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, sendAttempts, threadId, funcName, string(msg.Key), err)
+						logrus.Errorf("[%s/%d/%d] Skipped sending message to function after %v attempts: thread=%v function=%s key=%s err=%v",
+							consumer.Topic(), consumer.Partition(), msg.Offset, sendAttempts, threadId, funcName, string(msg.Key), err)
 						groupConsumer.MarkOffset(msg, "")
 						break
 					}
@@ -251,12 +260,13 @@ MessageLoop:
 					if delay > maxSendRetryDelay {
 						delay = time.Duration(float64(maxSendRetryDelay) * randomDelayJitter())
 					}
-					logrus.Infof("[%s/%d/%d] Delaying for %s before re-sending message: thread=%v function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, delay.String(), threadId, funcName, string(msg.Key))
+					logrus.Infof("[%s/%d/%d] Delaying for %s before re-sending message: thread=%v function=%s key=%s",
+						consumer.Topic(), consumer.Partition(), msg.Offset, delay.String(), threadId, funcName, string(msg.Key))
 
 					select {
 					case <-time.After(delay):
-					case <-ctx.Done():
-						logrus.Infof("[%s/%d/%d] Stopping consumer: thread=%v function=%s key=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName)
+					case <-rootContext.Done():
+						logrus.Infof("[%s/%d/%d] Stopping consumer: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, rootContext.Err())
 						return
 					}
 
@@ -264,7 +274,8 @@ MessageLoop:
 					continue
 				}
 
-				logrus.Infof("[%s/%d/%d] Sent message to function successfully: thread=%v function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key))
+				logrus.Infof("[%s/%d/%d] Sent message to function successfully: thread=%v function=%s key=%s duration=%s total-duration=%s",
+					consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), reqEnd.Sub(reqStart), reqEnd.Sub(startTime))
 				groupConsumer.MarkOffset(msg, "")
 				break
 			}
@@ -274,7 +285,7 @@ MessageLoop:
 				logrus.Errorf("[%s/%d] Partition-consumer error: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), threadId, funcName, err)
 			}
 		case <-rootContext.Done():
-			logrus.Infof("[%s/%d] Stopping partition-consumer: thread=%v function=%s", consumer.Topic(), consumer.Partition(), threadId, funcName)
+			logrus.Infof("[%s/%d] Stopping partition-consumer: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), threadId, funcName, rootContext.Err())
 			if err := consumer.Close(); err != nil {
 				logrus.Errorf("[%s/%d] Error while closing partition-consumer: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), threadId, funcName, err)
 			}
@@ -331,8 +342,8 @@ func newHTTPClient() *http.Client {
 		panic(fmt.Sprintf("defaultRoundTripper not an *http.Transport"))
 	}
 	defaultTransport := *defaultTransportPointer // dereference it to get a copy of the struct that the pointer points to
-	defaultTransport.MaxIdleConns = 100
-	defaultTransport.MaxIdleConnsPerHost = 100
+	defaultTransport.MaxIdleConns = 1024
+	defaultTransport.MaxIdleConnsPerHost = 1024
 
 	return &http.Client{Transport: &defaultTransport}
 }
@@ -343,6 +354,9 @@ func buildRequest(clientset kubernetes.Interface, funcName, namespace, eventName
 	if err != nil {
 		return nil, fmt.Errorf("Unable to create request %v", err)
 	}
+	req.ContentLength = int64(len(body))
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("User-Agent", UserAgent)
 	timestamp := time.Now().UTC()
 	eventID, err := kubelessutil.GetRandString(11)
 	if err != nil {
@@ -351,7 +365,6 @@ func buildRequest(clientset kubernetes.Interface, funcName, namespace, eventName
 	req.Header.Add("event-id", eventID)
 	req.Header.Add("event-time", timestamp.String())
 	req.Header.Add("event-namespace", eventNamespace)
-	req.Header.Add("Content-Type", "application/json")
 	req.Header.Add("event-type", "application/json")
 	return req, nil
 }
