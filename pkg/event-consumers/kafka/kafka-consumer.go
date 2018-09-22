@@ -52,11 +52,13 @@ const (
 )
 
 var (
-	stopM     map[string](chan struct{})
-	stoppedM  map[string](chan struct{})
-	consumerM map[string]bool
-	brokers   string
-	config    *cluster.Config
+	stopM         map[string](chan struct{})
+	stoppedM      map[string](chan struct{})
+	consumers     map[string]bool
+	consumersLock sync.Mutex
+
+	brokers string
+	config  *cluster.Config
 )
 
 func init() {
@@ -66,7 +68,7 @@ func init() {
 
 	stopM = make(map[string](chan struct{}))
 	stoppedM = make(map[string](chan struct{}))
-	consumerM = make(map[string]bool)
+	consumers = make(map[string]bool)
 
 	// Init config
 	// taking brokers from env var
@@ -284,12 +286,14 @@ MessageLoop:
 // CreateKafkaConsumer creates a goroutine that subscribes to Kafka topic
 func CreateKafkaConsumer(triggerObjName, funcName, ns, topic string, clientset kubernetes.Interface) error {
 	consumerID := generateUniqueConsumerGroupID(triggerObjName, funcName, ns, topic)
-	if !consumerM[consumerID] {
+	consumersLock.Lock()
+	defer consumersLock.Unlock()
+	if !consumers[consumerID] {
 		logrus.Infof("[%s] Creating Kafka consumer: function=%s trigger=%s", topic, funcName, triggerObjName)
 		stopM[consumerID] = make(chan struct{})
 		stoppedM[consumerID] = make(chan struct{})
 		go createConsumerProcess(brokers, topic, funcName, ns, consumerID, clientset, stopM[consumerID], stoppedM[consumerID])
-		consumerM[consumerID] = true
+		consumers[consumerID] = true
 		logrus.Infof("[%s] Created Kafka consumer: function=%s trigger=%s", topic, funcName, triggerObjName)
 	} else {
 		logrus.Infof("[%s] Consumer already exists, skipping: function=%s trigger=%s", topic, funcName, triggerObjName)
@@ -300,12 +304,14 @@ func CreateKafkaConsumer(triggerObjName, funcName, ns, topic string, clientset k
 // DeleteKafkaConsumer deletes goroutine created by CreateKafkaConsumer
 func DeleteKafkaConsumer(triggerObjName, funcName, ns, topic string) error {
 	consumerID := generateUniqueConsumerGroupID(triggerObjName, funcName, ns, topic)
-	if consumerM[consumerID] {
+	consumersLock.Lock()
+	defer consumersLock.Unlock()
+	if consumers[consumerID] {
 		logrus.Infof("[%s] Stopping/deleting consumer: function=%s trigger=%s", topic, funcName, triggerObjName)
 		// delete consumer process
 		close(stopM[consumerID])
 		<-stoppedM[consumerID]
-		delete(consumerM, consumerID)
+		delete(consumers, consumerID)
 		logrus.Infof("[%s] Stopped/deleted consumer: function=%s trigger=%s", topic, funcName, triggerObjName)
 	} else {
 		logrus.Infof("[%s] No matching consumer to stop/delete, skipping: function=%s trigger=%s", topic, funcName, triggerObjName)
