@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -38,9 +39,9 @@ import (
 
 // TODO (wdamron): Integrate retry configuration with Function spec
 const (
-	maxSendAttempts          = 10
+	maxSendAttempts          = math.MaxInt32
 	minSendRetryDelay        = 200 * time.Millisecond
-	maxSendRetryDelay        = 5 * time.Second
+	maxSendRetryDelay        = 60 * time.Second
 	sendRetryDelayMultiplier = 1.5
 	sendRetryDelayJitter     = 0.1 // should be a value in the range (0.0, 1.0]
 

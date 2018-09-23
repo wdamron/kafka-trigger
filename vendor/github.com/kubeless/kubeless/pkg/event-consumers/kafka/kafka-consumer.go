@@ -239,6 +239,10 @@ MessageLoop:
 						"status-code":    status,
 						"response":       body,
 					}).Errorf("Failed to send message to function")
+
+					if status == 409 {
+						break
+					}
 					if sendAttempts == maxSendAttempts {
 						msgLogger.Errorf("Skipped sending message to function after %v attempts", sendAttempts)
 
