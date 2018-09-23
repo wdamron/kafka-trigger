@@ -85,7 +85,7 @@ func init() {
 	config.Consumer.Offsets.CommitInterval = time.Second
 	config.Consumer.Return.Errors = true
 	config.Group.Mode = cluster.ConsumerModePartitions
-	config.Version = sarama.V0_11_0_0 // Headers are only supported in version 0.11+; see https://github.com/Shopify/sarama/blob/35324cf48e33d8260e1c7c18854465a904ade249/consumer.go#L19
+	config.Version = sarama.V1_1_0_0 // Headers are only supported in version 0.11+; see https://github.com/Shopify/sarama/blob/35324cf48e33d8260e1c7c18854465a904ade249/consumer.go#L19
 
 	var err error
 
@@ -123,99 +123,88 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 	// Init consumer
 	brokersSlice := []string{broker}
 	topicsSlice := []string{topic}
-
 	nextThreadId := uint64(0)
+	logger := logrus.StandardLogger().WithFields(logrus.Fields{
+		"topic":          topic,
+		"consumer-group": consumerGroupID,
+		"function":       funcName,
+	})
 
 	groupConsumer, err := cluster.NewConsumer(brokersSlice, consumerGroupID, topicsSlice, config)
 	if err != nil {
-		logrus.Infof("[%s] Failed to start group-consumer: broker=%v consumer-group=%s function=%s err=%v", topic, broker, consumerGroupID, funcName, err)
+		logger.WithField("err", err).Errorf("Failed to start group-consumer")
 	}
-	defer groupConsumer.Close()
+	defer groupConsumer.Close() // Close is idempotent
 
-	logrus.Infof("[%s] Started Kakfa group-consumer: broker=%v consumer-group=%s function=%s, ", topic, broker, consumerGroupID, funcName)
+	logger.Infof("Started group-consumer")
 
 	httpClient := newHTTPClient()
 
-	var wg sync.WaitGroup
 	assignments := groupConsumer.Partitions()
 	for {
 		select {
 		case partitionConsumer, ok := <-assignments:
 			if !ok {
-				wg.Wait()
-				logrus.Infof("[%s] Group-consumer closed: consumer-group=%s function=%s", topic, consumerGroupID, funcName)
+				logger.Infof("Group-consumer closed")
 				return
 			}
 
 			// Start a separate goroutine per partition to consume messages:
-			logrus.Infof("[%s/%d] Started Kafka partition-consumer: consumer-group=%s thread=%v function=%s", topic, partitionConsumer.Partition(), consumerGroupID, nextThreadId, funcName)
-			wg.Add(1)
-			go createPartitionConsumerProcess(groupConsumer, partitionConsumer, &wg, nextThreadId, funcName, ns, clientset, httpClient, stopchan)
+			logger.WithFields(logrus.Fields{"partition": partitionConsumer.Partition(), "thread": nextThreadId}).Infof("Started partition-consumer")
+			go createPartitionConsumerProcess(partitionConsumer, nextThreadId, funcName, ns, clientset, httpClient)
 			nextThreadId++
 
 		case <-stopchan:
-			logrus.Infof("[%s] Waiting for all partition-consumers to close: consumer-group=%s function=%s", topic, consumerGroupID, funcName)
-			wg.Wait()
+			logger.Infof("Closing group-consumer and all partition-consumers")
+			if err = groupConsumer.Close(); err != nil {
+				logger.WithField("err", err).Errorf("Error closing group-consumer and all partition-consumers")
+			}
 			return
 		}
 	}
 }
 
 func createPartitionConsumerProcess(
-	groupConsumer *cluster.Consumer,
 	consumer cluster.PartitionConsumer,
-	wg *sync.WaitGroup,
 	threadId uint64,
 	funcName, ns string,
 	clientset kubernetes.Interface,
-	httpClient *http.Client,
-	stopchan chan struct{}) {
+	httpClient *http.Client) {
 
 	headerBuffer := make([]byte, 0, 1024*32)
-	rootContext, cancelRoot := context.WithCancel(context.Background())
 	replacer := strings.NewReplacer("\r", "", "\n", "")
 	topic := consumer.Topic()
 
-	defer wg.Done()
-	defer cancelRoot()
+	logger := logrus.StandardLogger().WithFields(logrus.Fields{
+		"thread":    threadId,
+		"topic":     topic,
+		"partition": consumer.Partition(),
+		"function":  funcName,
+	})
 
-	go func() {
-		select {
-		case <-stopchan:
-			cancelRoot()
-		}
-	}()
-
-	// Consume messages, wait for signal to stopchan to exit
 MessageLoop:
 	for {
 		select {
 		case msg, more := <-consumer.Messages():
 			if !more {
-				logrus.Infof("[%s/%d] Partition-consumer closed: thread=%v function=%s", consumer.Topic(), consumer.Partition(), threadId, funcName)
+				logger.Infof("Partition-consumer closed", consumer.Topic(), consumer.Partition())
 				return
 			}
-			if logHeaders {
-				if len(msg.Headers) == 0 {
-					const none = "(none)"
-					headerBuffer = append(headerBuffer, none...)
-				} else {
-					for _, hdr := range msg.Headers {
-						headerBuffer = append(headerBuffer, hdr.Key...)
-						headerBuffer = append(headerBuffer, '=')
-						headerBuffer = append(headerBuffer, hdr.Value...)
-						headerBuffer = append(headerBuffer, ' ')
-					}
+			msgLogger := logger.WithFields(logrus.Fields{"offset": msg.Offset, "key": string(msg.Key)})
+			if logHeaders && len(msg.Headers) > 0 {
+				headers := logrus.Fields{}
+				for _, hdr := range msg.Headers {
+					headers[string(hdr.Key)] = string(hdr.Value)
 				}
-				logrus.Infof("[%s/%d/%d] Received Kafka message: thread=%v function=%s key=%s headers: %s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), string(headerBuffer))
+				msgLogger.WithFields(headers).Infof("Received message")
 				headerBuffer = headerBuffer[: 0 : 1024*32]
 			} else {
-				logrus.Infof("[%s/%d/%d] Received Kafka message: thread=%v function=%s key=%s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key))
+				msgLogger.Infof("Received message")
 			}
 
 			req, err := buildRequest(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
 			if err != nil {
-				logrus.Errorf("[%s/%d/%d] Unable to elaborate request: thread=%v function=%s key=%s err=%s", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), err)
+				msgLogger.WithField("err", err).Errorf("Unable to elaborate request")
 				continue MessageLoop
 			}
 
@@ -236,18 +225,24 @@ MessageLoop:
 
 			for {
 				reqStart := time.Now()
-				ctx, cancel := context.WithTimeout(rootContext, requestTimeout)
-				err := sendMessage(httpClient, req.WithContext(ctx))
+				ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+				status, body, err := sendMessage(httpClient, req.WithContext(ctx))
 				cancel()
+				sendAttempts++
 				reqEnd := time.Now()
 				if err != nil {
-					sendAttempts++
-					logrus.Errorf("[%s/%d/%d] Failed to send message to function: thread=%v function=%s key=%s duration=%s total-duration=%s attempts=%v err=%v",
-						consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), reqEnd.Sub(reqStart), reqEnd.Sub(startTime), sendAttempts, err)
+					msgLogger.WithFields(logrus.Fields{
+						"attempts":       sendAttempts,
+						"duration":       reqEnd.Sub(reqStart),
+						"total-duration": reqEnd.Sub(startTime),
+						"err":            err,
+						"status-code":    status,
+						"response":       body,
+					}).Errorf("Failed to send message to function")
 					if sendAttempts == maxSendAttempts {
-						logrus.Errorf("[%s/%d/%d] Skipped sending message to function after %v attempts: thread=%v function=%s key=%s err=%v",
-							consumer.Topic(), consumer.Partition(), msg.Offset, sendAttempts, threadId, funcName, string(msg.Key), err)
-						groupConsumer.MarkOffset(msg, "")
+						msgLogger.Errorf("Skipped sending message to function after %v attempts", sendAttempts)
+
+						consumer.MarkOffset(msg.Offset, "")
 						break
 					}
 
@@ -260,74 +255,64 @@ MessageLoop:
 					if delay > maxSendRetryDelay {
 						delay = time.Duration(float64(maxSendRetryDelay) * randomDelayJitter())
 					}
-					logrus.Infof("[%s/%d/%d] Delaying for %s before re-sending message: thread=%v function=%s key=%s",
-						consumer.Topic(), consumer.Partition(), msg.Offset, delay.String(), threadId, funcName, string(msg.Key))
 
-					select {
-					case <-time.After(delay):
-					case <-rootContext.Done():
-						logrus.Infof("[%s/%d/%d] Stopping consumer: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, rootContext.Err())
-						return
-					}
-
+					msgLogger.WithField("delay", delay.String()).Infof("Delaying before re-sending message")
+					time.Sleep(delay)
 					lastDelay = delay
 					continue
 				}
 
-				logrus.Infof("[%s/%d/%d] Sent message to function successfully: thread=%v function=%s key=%s duration=%s total-duration=%s",
-					consumer.Topic(), consumer.Partition(), msg.Offset, threadId, funcName, string(msg.Key), reqEnd.Sub(reqStart), reqEnd.Sub(startTime))
-				groupConsumer.MarkOffset(msg, "")
+				msgLogger.WithFields(logrus.Fields{
+					"attempts":       sendAttempts,
+					"duration":       reqEnd.Sub(reqStart),
+					"total-duration": reqEnd.Sub(startTime),
+				}).Infof("Sent message to function successfully")
+
+				consumer.MarkOffset(msg.Offset, "")
 				break
 			}
 
 		case err, more := <-consumer.Errors():
 			if more {
-				logrus.Errorf("[%s/%d] Partition-consumer error: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), threadId, funcName, err)
+				logger.WithField("err", err.Error()).Errorf("Partition-consumer error")
 			}
-		case <-rootContext.Done():
-			logrus.Infof("[%s/%d] Stopping partition-consumer: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), threadId, funcName, rootContext.Err())
-			if err := consumer.Close(); err != nil {
-				logrus.Errorf("[%s/%d] Error while closing partition-consumer: thread=%v function=%s err=%v", consumer.Topic(), consumer.Partition(), threadId, funcName, err)
-			}
-			return
 		}
 	}
 }
 
 // CreateKafkaConsumer creates a goroutine that subscribes to Kafka topic
-func CreateKafkaConsumer(triggerObjName, funcName, ns, topic string, clientset kubernetes.Interface) error {
+func CreateKafkaConsumer(triggerObjName, funcName, ns, topic string, clientset kubernetes.Interface) {
 	consumerID := generateUniqueConsumerGroupID(triggerObjName, funcName, ns, topic)
 	consumersLock.Lock()
 	defer consumersLock.Unlock()
+	logger := logrus.StandardLogger().WithFields(logrus.Fields{"topic": topic, "function": funcName, "trigger": triggerObjName})
 	if !consumers[consumerID] {
-		logrus.Infof("[%s] Creating Kafka consumer: function=%s trigger=%s", topic, funcName, triggerObjName)
+		logger.Infof("Starting group-consumer")
 		stopM[consumerID] = make(chan struct{})
 		stoppedM[consumerID] = make(chan struct{})
 		go createConsumerProcess(brokers, topic, funcName, ns, consumerID, clientset, stopM[consumerID], stoppedM[consumerID])
 		consumers[consumerID] = true
-		logrus.Infof("[%s] Created Kafka consumer: function=%s trigger=%s", topic, funcName, triggerObjName)
 	} else {
-		logrus.Infof("[%s] Consumer already exists, skipping: function=%s trigger=%s", topic, funcName, triggerObjName)
+		logger.Infof("Group-consumer already exists; skipping")
 	}
-	return nil
 }
 
 // DeleteKafkaConsumer deletes goroutine created by CreateKafkaConsumer
-func DeleteKafkaConsumer(triggerObjName, funcName, ns, topic string) error {
+func DeleteKafkaConsumer(triggerObjName, funcName, ns, topic string) {
 	consumerID := generateUniqueConsumerGroupID(triggerObjName, funcName, ns, topic)
 	consumersLock.Lock()
 	defer consumersLock.Unlock()
+	logger := logrus.StandardLogger().WithFields(logrus.Fields{"topic": topic, "function": funcName, "trigger": triggerObjName})
 	if consumers[consumerID] {
-		logrus.Infof("[%s] Stopping/deleting consumer: function=%s trigger=%s", topic, funcName, triggerObjName)
+		logger.Infof("Stopping/deleting group-consumer")
 		// delete consumer process
 		close(stopM[consumerID])
 		<-stoppedM[consumerID]
 		delete(consumers, consumerID)
-		logrus.Infof("[%s] Stopped/deleted consumer: function=%s trigger=%s", topic, funcName, triggerObjName)
+		logger.Infof("Stopped/deleted group-consumer")
 	} else {
-		logrus.Infof("[%s] No matching consumer to stop/delete, skipping: function=%s trigger=%s", topic, funcName, triggerObjName)
+		logger.Infof("No matching group-consumer to stop/delete; skipping")
 	}
-	return nil
 }
 
 func generateUniqueConsumerGroupID(triggerObjName, funcName, ns, topic string) string {
@@ -352,7 +337,7 @@ func newHTTPClient() *http.Client {
 func buildRequest(clientset kubernetes.Interface, funcName, namespace, eventNamespace, method, body string) (*http.Request, error) {
 	req, err := http.NewRequest(method, fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", funcName, namespace, funcPort), strings.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("Unable to create request %v", err)
+		return nil, err
 	}
 	req.ContentLength = int64(len(body))
 	req.Header.Add("Content-Type", "application/json")
@@ -360,7 +345,7 @@ func buildRequest(clientset kubernetes.Interface, funcName, namespace, eventName
 	timestamp := time.Now().UTC()
 	eventID, err := kubelessutil.GetRandString(11)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to create a event-ID %v", err)
+		return nil, fmt.Errorf("Failed to create a event-ID: %v", err)
 	}
 	req.Header.Add("event-id", eventID)
 	req.Header.Add("event-time", timestamp.String())
@@ -369,15 +354,22 @@ func buildRequest(clientset kubernetes.Interface, funcName, namespace, eventName
 	return req, nil
 }
 
-func sendMessage(client *http.Client, req *http.Request) error {
+func sendMessage(client *http.Client, req *http.Request) (int, string, error) {
 	resp, err := client.Do(req)
+	status := -1
+	if resp != nil {
+		status = resp.StatusCode
+	}
 	if err != nil {
-		return err
+		return status, "", err
+	}
+	if status != 200 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		return status, string(body), fmt.Errorf("Received non-200 response")
 	}
 	io.Copy(ioutil.Discard, resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("Error: received error code %d: %s", resp.StatusCode, resp.Status)
-	}
-	return nil
+
+	return 200, "", nil
 }

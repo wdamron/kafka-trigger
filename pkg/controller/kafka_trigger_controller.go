@@ -186,7 +186,7 @@ func (c *KafkaTriggerController) processNextItem() bool {
 }
 
 func (c *KafkaTriggerController) syncKafkaTrigger(key string) error {
-	c.logger.Infof("Processing update to Kafka Trigger: %s", key)
+	c.logger.Infof("Syncing Kafka trigger: cache-key=%s", key)
 	ns, triggerObjName, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
@@ -209,8 +209,16 @@ func (c *KafkaTriggerController) syncKafkaTrigger(key string) error {
 		return errors.New("Kafka Trigger Topic can't be empty. Please check the trigger object %s" + key)
 	}
 
+	deleted := triggerObj.ObjectMeta.DeletionTimestamp != nil
+	logger := c.logger.WithFields(logrus.Fields{
+		"topic":     topic,
+		"trigger":   triggerObjName,
+		"namespace": ns,
+	})
+
 	// Kafka trigger API object is marked for deletion (DeletionTimestamp != nil), so lets process the delete update
-	if triggerObj.ObjectMeta.DeletionTimestamp != nil {
+	if deleted {
+		logger.Infof("Processing deleted Kafka trigger")
 
 		// If finalizer is removed, then we already processed the delete update, so just return
 		if !c.kafkaTriggerHasFinalizer(triggerObj) {
@@ -220,72 +228,69 @@ func (c *KafkaTriggerController) syncKafkaTrigger(key string) error {
 		// Kafka Trigger object should be deleted, so process the associated functions and remove the finalizer
 		funcSelector, err := apimachineryHelpers.LabelSelectorAsSelector(&triggerObj.Spec.FunctionSelector)
 		if err != nil {
-			c.logger.Errorf("Failed to convert LabelSelector %v in Kafka Trigger object %s to Selector due to %v: ", triggerObj.Spec.FunctionSelector, key, err)
+			logger.WithField("err", err).Errorf("Failed to convert LabelSelector %v in Kafka Trigger object to Selector", triggerObj.Spec.FunctionSelector)
 			return err
 		}
 		functions, err := c.kubelessclient.KubelessV1beta1().Functions(triggerObj.ObjectMeta.Namespace).List(apimachineryHelpers.ListOptions{
 			LabelSelector: funcSelector.String(),
 		})
 		if err != nil {
-			c.logger.Errorf("Failed to list associated functions with Kafka trigger %s by selector due to %s: ", key, err)
+			logger.WithField("err", err).Errorf("Failed to list associated functions with Kafka trigger by selector")
 			return err
 		}
 		if len(functions.Items) == 0 {
-			c.logger.Infof("No matching functions found for Kafka trigger %s so marking CRD object for deleteion", key)
+			logger.Infof("No matching functions found for Kafka trigger so marking CRD object for deletion")
 		}
 
 		for _, function := range functions.Items {
 			funcName := function.ObjectMeta.Name
-			err = kafka.DeleteKafkaConsumer(triggerObjName, funcName, ns, topic)
-			if err != nil {
-				c.logger.Errorf("Failed to delete the Kafka consumer for the function %s associated with the Kafka trigger %s due to %v: ", funcName, key, err)
-			}
+			kafka.DeleteKafkaConsumer(triggerObjName, funcName, ns, topic)
 		}
 
 		// remove finalizer from the kafka trigger object, so that we dont have to process any further and object can be deleted
 		err = c.kafkaTriggerObjRemoveFinalizer(triggerObj)
 		if err != nil {
-			c.logger.Errorf("Failed to remove Kafka trigger controller as finalizer to Kafka Trigger Obj: %s CRD object due to: %v: ", triggerObj.ObjectMeta.Name, err)
+			logger.WithField("err", err).Errorf("Failed to remove Kafka trigger controller as finalizer to Kafka Trigger CRD")
 			return err
 		}
-		c.logger.Infof("Kafka trigger %s has been successfully processed and marked for deletion", key)
+		logger.Infof("Successfully processed deleted Kafka trigger")
 		return nil
 	}
+
+	logger.Infof("Processing added/updated Kafka trigger")
 
 	// If Kafka trigger API in not marked with self as finalizer, then add the finalizer
 	if !c.kafkaTriggerHasFinalizer(triggerObj) {
 		err = c.kafkaTriggerObjAddFinalizer(triggerObj)
 		if err != nil {
-			c.logger.Errorf("Error adding Kafka trigger controller as finalizer to Kafka Trigger Obj: %s CRD object due to: %v: ", triggerObj.ObjectMeta.Name, err)
+			logger.WithField("err", err).Errorf("Error adding Kafka trigger controller as finalizer to Kafka Trigger CRD")
 			return err
 		}
 	}
 
 	funcSelector, err := apimachineryHelpers.LabelSelectorAsSelector(&triggerObj.Spec.FunctionSelector)
 	if err != nil {
-		c.logger.Errorf("Failed to convert LabelSelector %v in Kafka Trigger object %s to Selector due to %v: ", triggerObj.Spec.FunctionSelector, key, err)
+		logger.WithField("err", err).Errorf("Failed to convert LabelSelector %v in Kafka Trigger to Selector", triggerObj.Spec.FunctionSelector)
 		return err
 	}
 	functions, err := c.kubelessclient.KubelessV1beta1().Functions(triggerObj.ObjectMeta.Namespace).List(apimachineryHelpers.ListOptions{
 		LabelSelector: funcSelector.String(),
 	})
 	if err != nil {
-		c.logger.Errorf("Failed to list associated functions with Kafka trigger %s by Selector due to %s: ", key, err)
+		logger.WithField("err", err).Errorf("Failed to list associated functions with Kafka trigger by Selector")
 	}
 
 	if len(functions.Items) == 0 {
-		c.logger.Infof("No matching functions with selector %v found in namespace %s", funcSelector, ns)
+		logger.Infof("No matching functions with selector %v", funcSelector)
+		return nil
 	}
 
 	for _, function := range functions.Items {
 		funcName := function.ObjectMeta.Name
-		err = kafka.CreateKafkaConsumer(triggerObjName, funcName, ns, topic, c.kubernetesClient)
-		if err != nil {
-			c.logger.Errorf("Failed to create the Kafka consumer for the function %s associated with the Kafka trigger %s due to %v: ", funcName, key, err)
-		}
+		kafka.CreateKafkaConsumer(triggerObjName, funcName, ns, topic, c.kubernetesClient)
 	}
 
-	c.logger.Infof("Processed change to Kafka trigger: %s Namespace: %s", triggerObj.ObjectMeta.Name, ns)
+	logger.Infof("Successfully processed added/updated Kafka trigger")
 	return nil
 }
 
@@ -295,42 +300,44 @@ func (c *KafkaTriggerController) FunctionAddedDeletedUpdated(obj interface{}, de
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			c.logger.Errorf("Couldn't get object from tombstone %#v", obj)
+			c.logger.Errorf("Couldn't get object from tombstone: %#v", obj)
 			return
 		}
 		functionObj, ok = tombstone.Obj.(*kubelessApi.Function)
 		if !ok {
-			c.logger.Errorf("Tombstone contained object that is not a Function object %#v", obj)
+			c.logger.Errorf("Tombstone contained object that is not a Function object: %#v", obj)
 			return
 		}
 	}
 
-	c.logger.Infof("Processing update to function object %s Namespace: %s", functionObj.Name, functionObj.Namespace)
+	logger := c.logger.WithFields(logrus.Fields{"function": functionObj.Name, "namespace": functionObj.Namespace})
+
+	if deleted {
+		logger.Infof("Function deleted")
+	} else {
+		logger.Infof("Function added/updated")
+	}
 	kafkaTriggers, err := c.kafkaclient.KubelessV1beta1().KafkaTriggers(functionObj.Namespace).List(apimachineryHelpers.ListOptions{})
 	if err != nil {
-		c.logger.Errorf("Failed to get list of Kafka trigger in namespace %s due to %s: ", functionObj.ObjectMeta.Namespace, err)
+		logger.WithField("err", err).Errorf("Failed to get list of Kafka triggers")
 		return
 	}
 
 	for _, triggerObj := range kafkaTriggers.Items {
 		funcSelector, err := apimachineryHelpers.LabelSelectorAsSelector(&triggerObj.Spec.FunctionSelector)
 		if err != nil {
-			c.logger.Errorf("Failed to convert LabelSelector to Selector due to %s: ", err)
+			logger.WithField("err", err).Errorf("Failed to convert LabelSelector to Selector")
 		}
 		if !funcSelector.Matches(labels.Set(functionObj.Labels)) {
 			continue
 		}
 		if deleted {
-			c.logger.Infof("We got a Kafka trigger  %s that is associated with deleted function %s so cleanup Kafka consumer", triggerObj.Name, functionObj.Name)
 			kafka.DeleteKafkaConsumer(triggerObj.ObjectMeta.Name, functionObj.ObjectMeta.Name, functionObj.ObjectMeta.Namespace, triggerObj.Spec.Topic)
-			c.logger.Infof("Successfully removed Kafka consumer for Function: %s", functionObj.Name)
 		} else {
-			c.logger.Infof("We got a Kafka trigger  %s that function %s need to be associated so create Kafka consumer", triggerObj.Name, functionObj.Name)
 			kafka.CreateKafkaConsumer(triggerObj.Name, functionObj.Name, functionObj.Namespace, triggerObj.Spec.Topic, c.kubernetesClient)
-			c.logger.Infof("Successfully created Kafka consumer for Function: %s", functionObj.Name)
 		}
 	}
-	c.logger.Infof("Successfully processed update to function object %s Namespace: %s", functionObj.Name, functionObj.Namespace)
+	logger.Infof("Successfully processed update to function")
 }
 
 func (c *KafkaTriggerController) kafkaTriggerObjNeedFinalizer(triggercObj *kafkaApi.KafkaTrigger) bool {
