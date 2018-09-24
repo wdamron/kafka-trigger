@@ -17,7 +17,7 @@ limitations under the License.
 package kafka
 
 import (
-	"context"
+	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -31,22 +31,21 @@ import (
 
 	"github.com/Shopify/sarama"
 	"github.com/bsm/sarama-cluster"
-	kubelessutil "github.com/kubeless/kubeless/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
 )
 
 // TODO (wdamron): Integrate retry configuration with Function spec
 const (
-	maxSendAttempts          = 10
+	maxSendAttempts          = 0
 	minSendRetryDelay        = 200 * time.Millisecond
-	maxSendRetryDelay        = 5 * time.Second
+	maxSendRetryDelay        = 60 * time.Second
 	sendRetryDelayMultiplier = 1.5
 	sendRetryDelayJitter     = 0.1 // should be a value in the range (0.0, 1.0]
 
 	requestTimeout = 30 * time.Minute
 
-	funcPort = 8080
+	funcPort = "8080"
 
 	logHeaders = true
 )
@@ -61,6 +60,8 @@ var (
 	config  *cluster.Config
 
 	UserAgent = "" // filled in during linking
+
+	headerValueReplacer = strings.NewReplacer("\r", "", "\n", "")
 )
 
 func init() {
@@ -124,11 +125,7 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 	brokersSlice := []string{broker}
 	topicsSlice := []string{topic}
 	nextThreadId := uint64(0)
-	logger := logrus.StandardLogger().WithFields(logrus.Fields{
-		"topic":          topic,
-		"consumer-group": consumerGroupID,
-		"function":       funcName,
-	})
+	logger := logrus.StandardLogger().WithFields(logrus.Fields{"topic": topic, "consumer-group": consumerGroupID, "function": funcName})
 
 	groupConsumer, err := cluster.NewConsumer(brokersSlice, consumerGroupID, topicsSlice, config)
 	if err != nil {
@@ -171,16 +168,8 @@ func createPartitionConsumerProcess(
 	clientset kubernetes.Interface,
 	httpClient *http.Client) {
 
-	headerBuffer := make([]byte, 0, 1024*32)
-	replacer := strings.NewReplacer("\r", "", "\n", "")
 	topic := consumer.Topic()
-
-	logger := logrus.StandardLogger().WithFields(logrus.Fields{
-		"thread":    threadId,
-		"topic":     topic,
-		"partition": consumer.Partition(),
-		"function":  funcName,
-	})
+	logger := logrus.StandardLogger().WithFields(logrus.Fields{"thread": threadId, "topic": topic, "partition": consumer.Partition(), "function": funcName})
 
 MessageLoop:
 	for {
@@ -194,86 +183,74 @@ MessageLoop:
 			if logHeaders && len(msg.Headers) > 0 {
 				headers := logrus.Fields{}
 				for _, hdr := range msg.Headers {
-					headers[string(hdr.Key)] = string(hdr.Value)
+					if len(hdr.Value) != 0 {
+						headers[string(hdr.Key)] = string(hdr.Value)
+					}
 				}
-				msgLogger.WithFields(headers).Infof("Received message")
-				headerBuffer = headerBuffer[: 0 : 1024*32]
+				msgLogger.WithFields(headers).Infof("[%s/%d/%d] Received message", topic, msg.Partition, msg.Offset)
 			} else {
-				msgLogger.Infof("Received message")
-			}
-
-			req, err := buildRequest(clientset, funcName, ns, "kafkatriggers.kubeless.io", "POST", string(msg.Value))
-			if err != nil {
-				msgLogger.WithField("err", err).Errorf("Unable to elaborate request")
-				continue MessageLoop
-			}
-
-			req.Header.Add("X-Kafka-Topic", topic)
-			req.Header.Add("X-Kafka-Partition", strconv.Itoa(int(msg.Partition)))
-			req.Header.Add("X-Kafka-Offset", strconv.Itoa(int(msg.Offset)))
-			req.Header.Add("X-Kafka-Message-Key", replacer.Replace(string(msg.Key)))
-			req.Header.Add("X-Kafka-Timestamp", msg.Timestamp.Format(time.RFC3339Nano))
-			if len(msg.Headers) != 0 {
-				for _, hdr := range msg.Headers {
-					req.Header.Add("X-Attr-"+string(hdr.Key), replacer.Replace(string(hdr.Value)))
-				}
+				msgLogger.Infof("[%s/%d/%d] Received message", topic, msg.Partition, msg.Offset)
 			}
 
 			var lastDelay time.Duration
 			sendAttempts := 0
 			startTime := time.Now()
 
+			req, err := buildRequest(funcName, ns, msg)
+			if err != nil {
+				msgLogger.WithField("err", err).Errorf("Unable to elaborate request")
+				continue
+			}
+
 			for {
 				reqStart := time.Now()
-				ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-				status, body, err := sendMessage(httpClient, req.WithContext(ctx))
-				cancel()
+				if sendAttempts > 0 {
+					req.Body = ioutil.NopCloser(bytes.NewReader(msg.Value))
+				}
+				status, body, err := sendMessage(httpClient, req)
 				sendAttempts++
 				reqEnd := time.Now()
-				if err != nil {
-					msgLogger.WithFields(logrus.Fields{
-						"attempts":       sendAttempts,
-						"duration":       reqEnd.Sub(reqStart),
-						"total-duration": reqEnd.Sub(startTime),
-						"err":            err,
-						"status-code":    status,
-						"response":       body,
-					}).Errorf("Failed to send message to function")
 
-					if status == 409 {
-						break
-					}
-					if sendAttempts == maxSendAttempts {
-						msgLogger.Errorf("Skipped sending message to function after %v attempts", sendAttempts)
+				if err == nil {
+					msgLogger.WithFields(logrus.Fields{"attempts": sendAttempts, "duration": reqEnd.Sub(reqStart), "total-duration": reqEnd.Sub(startTime)}).
+						Infof("[%s/%d/%d] Sent message to function successfully", topic, msg.Partition, msg.Offset)
 
-						consumer.MarkOffset(msg.Offset, "")
-						break
-					}
-
-					var delay time.Duration
-					if lastDelay < minSendRetryDelay {
-						delay = minSendRetryDelay
-					} else {
-						delay = time.Duration(float64(lastDelay) * sendRetryDelayMultiplier * randomDelayJitter())
-					}
-					if delay > maxSendRetryDelay {
-						delay = time.Duration(float64(maxSendRetryDelay) * randomDelayJitter())
-					}
-
-					msgLogger.WithField("delay", delay.String()).Infof("Delaying before re-sending message")
-					time.Sleep(delay)
-					lastDelay = delay
-					continue
+					consumer.MarkOffset(msg.Offset, "")
+					continue MessageLoop
 				}
 
 				msgLogger.WithFields(logrus.Fields{
 					"attempts":       sendAttempts,
 					"duration":       reqEnd.Sub(reqStart),
 					"total-duration": reqEnd.Sub(startTime),
-				}).Infof("Sent message to function successfully")
+					"err":            err,
+					"status-code":    status,
+					"response":       body,
+				}).Errorf("[%s/%d/%d] Failed to send message to function", topic, msg.Partition, msg.Offset)
 
-				consumer.MarkOffset(msg.Offset, "")
-				break
+				if status == 409 {
+					continue MessageLoop
+				}
+				if maxSendAttempts > 0 && sendAttempts >= maxSendAttempts {
+					msgLogger.Errorf("Skipped sending message to function after %v attempts", sendAttempts)
+
+					consumer.MarkOffset(msg.Offset, "")
+					continue MessageLoop
+				}
+
+				var delay time.Duration
+				if lastDelay < minSendRetryDelay {
+					delay = minSendRetryDelay
+				} else {
+					delay = time.Duration(float64(lastDelay) * sendRetryDelayMultiplier * randomDelayJitter())
+				}
+				if delay > maxSendRetryDelay {
+					delay = time.Duration(float64(maxSendRetryDelay) * randomDelayJitter())
+				}
+
+				msgLogger.WithField("delay", delay.String()).Infof("[%s/%d/%d] Delaying before re-sending message", topic, msg.Partition, msg.Offset)
+				time.Sleep(delay)
+				lastDelay = delay
 			}
 
 		case err, more := <-consumer.Errors():
@@ -324,37 +301,34 @@ func generateUniqueConsumerGroupID(triggerObjName, funcName, ns, topic string) s
 }
 
 func newHTTPClient() *http.Client {
-	// Customize the Transport to have larger connection pool
-	defaultRoundTripper := http.DefaultTransport
-	defaultTransportPointer, ok := defaultRoundTripper.(*http.Transport)
-	if !ok {
-		panic(fmt.Sprintf("defaultRoundTripper not an *http.Transport"))
-	}
-	defaultTransport := *defaultTransportPointer // dereference it to get a copy of the struct that the pointer points to
-	defaultTransport.MaxIdleConns = 1024
-	defaultTransport.MaxIdleConnsPerHost = 1024
-
-	return &http.Client{Transport: &defaultTransport}
+	defaultTransport := http.DefaultTransport.(*http.Transport)
+	transport := *defaultTransport
+	transport.MaxIdleConns = 512
+	transport.MaxIdleConnsPerHost = 512
+	return &http.Client{Transport: &transport, Timeout: requestTimeout}
 }
 
-// GetHTTPReq returns the http request object that can be used to send a event with payload to function service
-func buildRequest(clientset kubernetes.Interface, funcName, namespace, eventNamespace, method, body string) (*http.Request, error) {
-	req, err := http.NewRequest(method, fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", funcName, namespace, funcPort), strings.NewReader(body))
+func buildRequest(funcName, namespace string, msg *sarama.ConsumerMessage) (*http.Request, error) {
+	url := fmt.Sprintf("http://%s.%s.svc.cluster.local:%s", funcName, namespace, funcPort)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(msg.Value))
 	if err != nil {
 		return nil, err
 	}
-	req.ContentLength = int64(len(body))
 	req.Header.Add("Content-Type", "application/json")
 	req.Header.Add("User-Agent", UserAgent)
-	timestamp := time.Now().UTC()
-	eventID, err := kubelessutil.GetRandString(11)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to create a event-ID: %v", err)
+	req.Header.Add("X-Kafka-Topic", msg.Topic)
+	req.Header.Add("X-Kafka-Partition", strconv.Itoa(int(msg.Partition)))
+	req.Header.Add("X-Kafka-Offset", strconv.Itoa(int(msg.Offset)))
+	if len(msg.Key) > 0 {
+		req.Header.Add("X-Kafka-Message-Key", headerValueReplacer.Replace(string(msg.Key)))
 	}
-	req.Header.Add("event-id", eventID)
-	req.Header.Add("event-time", timestamp.String())
-	req.Header.Add("event-namespace", eventNamespace)
-	req.Header.Add("event-type", "application/json")
+	req.Header.Add("X-Kafka-Timestamp", msg.Timestamp.Format(time.RFC3339Nano))
+	if len(msg.Headers) != 0 {
+		for _, hdr := range msg.Headers {
+			req.Header.Add("X-Attr-"+string(hdr.Key), headerValueReplacer.Replace(string(hdr.Value)))
+		}
+	}
+
 	return req, nil
 }
 
