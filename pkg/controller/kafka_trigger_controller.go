@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -206,7 +205,7 @@ func (c *KafkaTriggerController) syncKafkaTrigger(key string) error {
 	triggerObj := obj.(*kafkaApi.KafkaTrigger)
 	topic := triggerObj.Spec.Topic
 	if topic == "" {
-		return errors.New("Kafka Trigger Topic can't be empty. Please check the trigger object %s" + key)
+		return fmt.Errorf("Kafka Trigger Topic can't be empty. Please check the trigger object %s", key)
 	}
 
 	deleted := triggerObj.ObjectMeta.DeletionTimestamp != nil

@@ -18,6 +18,7 @@ package kafka
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -61,6 +62,7 @@ var (
 
 	UserAgent = "" // filled in during linking
 
+	httpClient          *http.Client
 	headerValueReplacer = strings.NewReplacer("\r", "", "\n", "")
 )
 
@@ -106,6 +108,12 @@ func init() {
 		}
 	}
 
+	defaultTransport := http.DefaultTransport.(*http.Transport)
+	transport := *defaultTransport
+	transport.MaxIdleConns = 512
+	transport.MaxIdleConnsPerHost = 128
+	httpClient = &http.Client{Transport: &transport, Timeout: requestTimeout}
+
 }
 
 func randomDelayJitter() float64 {
@@ -131,52 +139,65 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 	if err != nil {
 		logger.WithField("err", err).Errorf("Failed to start group-consumer")
 	}
+
+	defer func() {
+		logger.Infof("Closing group-consumer and all partition-consumers (if not already closed)")
+		if err = groupConsumer.Close(); err != nil {
+			logger.WithField("err", err).Errorf("Error closing group-consumer and all partition-consumers")
+		}
+	}()
 	defer groupConsumer.Close() // Close is idempotent
 
 	logger.Infof("Started group-consumer")
-
-	httpClient := newHTTPClient()
 
 	assignments := groupConsumer.Partitions()
 	for {
 		select {
 		case partitionConsumer, ok := <-assignments:
 			if !ok {
-				logger.Infof("Group-consumer closed")
 				return
 			}
-
+			partitionLogger := logger.WithFields(logrus.Fields{"thread": nextThreadId, "topic": partitionConsumer.Topic(), "partition": partitionConsumer.Partition(), "function": funcName})
 			// Start a separate goroutine per partition to consume messages:
-			logger.WithFields(logrus.Fields{"partition": partitionConsumer.Partition(), "thread": nextThreadId}).Infof("Started partition-consumer")
-			go createPartitionConsumerProcess(partitionConsumer, nextThreadId, funcName, ns, clientset, httpClient)
+			partitionLogger.Infof("Started partition-consumer")
+			go createPartitionConsumerProcess(partitionLogger, partitionConsumer, nextThreadId, funcName, ns, clientset, stopchan)
 			nextThreadId++
 
 		case <-stopchan:
-			logger.Infof("Closing group-consumer and all partition-consumers")
-			if err = groupConsumer.Close(); err != nil {
-				logger.WithField("err", err).Errorf("Error closing group-consumer and all partition-consumers")
-			}
 			return
 		}
 	}
 }
 
 func createPartitionConsumerProcess(
+	logger *logrus.Entry,
 	consumer cluster.PartitionConsumer,
 	threadId uint64,
 	funcName, ns string,
 	clientset kubernetes.Interface,
-	httpClient *http.Client) {
+	stopchan chan struct{}) {
+
+	logger.Infof("Started partition-consumer")
 
 	topic := consumer.Topic()
-	logger := logrus.StandardLogger().WithFields(logrus.Fields{"thread": threadId, "topic": topic, "partition": consumer.Partition(), "function": funcName})
+	consumerContext, cancelConsumerContext := context.WithCancel(context.Background())
+	defer func() {
+		cancelConsumerContext()
+		logger.Infof("Partition-consumer closed")
+	}()
+
+	go func() {
+		<-stopchan
+		cancelConsumerContext()
+	}()
 
 MessageLoop:
 	for {
 		select {
+		case <-consumerContext.Done():
+			return
 		case msg, more := <-consumer.Messages():
 			if !more {
-				logger.Infof("Partition-consumer closed", consumer.Topic(), consumer.Partition())
 				return
 			}
 			msgLogger := logger.WithFields(logrus.Fields{"offset": msg.Offset, "key": string(msg.Key)})
@@ -192,22 +213,36 @@ MessageLoop:
 				msgLogger.Infof("[%s/%d/%d] Received message", topic, msg.Partition, msg.Offset)
 			}
 
+			if len(msg.Value) == 0 {
+				msgLogger.Errorf("[%s/%d/%d] Skipped sending message with missing contents", topic, msg.Partition, msg.Offset)
+				continue
+			}
+
 			var lastDelay time.Duration
 			sendAttempts := 0
 			startTime := time.Now()
 
-			req, err := buildRequest(funcName, ns, msg)
+			baseReq, err := buildRequest(funcName, ns, msg)
 			if err != nil {
 				msgLogger.WithField("err", err).Errorf("Unable to elaborate request")
 				continue
 			}
 
 			for {
+				select {
+				case <-consumerContext.Done():
+					return
+				default:
+				}
+
 				reqStart := time.Now()
+				reqContext, cancelReqContext := context.WithTimeout(consumerContext, requestTimeout)
+				req := baseReq.WithContext(reqContext)
 				if sendAttempts > 0 {
 					req.Body = ioutil.NopCloser(bytes.NewReader(msg.Value))
 				}
-				status, body, err := sendMessage(httpClient, req)
+				status, body, err := sendMessage(httpClient, req.WithContext(reqContext))
+				cancelReqContext()
 				sendAttempts++
 				reqEnd := time.Now()
 
@@ -249,8 +284,13 @@ MessageLoop:
 				}
 
 				msgLogger.WithField("delay", delay.String()).Infof("[%s/%d/%d] Delaying before re-sending message", topic, msg.Partition, msg.Offset)
-				time.Sleep(delay)
-				lastDelay = delay
+
+				select {
+				case <-consumerContext.Done():
+					return
+				case <-time.After(delay):
+					lastDelay = delay
+				}
 			}
 
 		case err, more := <-consumer.Errors():
@@ -298,14 +338,6 @@ func DeleteKafkaConsumer(triggerObjName, funcName, ns, topic string) {
 
 func generateUniqueConsumerGroupID(triggerObjName, funcName, ns, topic string) string {
 	return ns + "_" + triggerObjName + "_" + funcName + "_" + topic
-}
-
-func newHTTPClient() *http.Client {
-	defaultTransport := http.DefaultTransport.(*http.Transport)
-	transport := *defaultTransport
-	transport.MaxIdleConns = 512
-	transport.MaxIdleConnsPerHost = 512
-	return &http.Client{Transport: &transport, Timeout: requestTimeout}
 }
 
 func buildRequest(funcName, namespace string, msg *sarama.ConsumerMessage) (*http.Request, error) {
