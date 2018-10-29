@@ -146,7 +146,6 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 			logger.WithField("err", err).Errorf("Error closing group-consumer and all partition-consumers")
 		}
 	}()
-	defer groupConsumer.Close() // Close is idempotent
 
 	logger.Infof("Started group-consumer")
 
@@ -159,7 +158,6 @@ func createConsumerProcess(broker, topic, funcName, ns, consumerGroupID string, 
 			}
 			partitionLogger := logger.WithFields(logrus.Fields{"thread": nextThreadId, "topic": partitionConsumer.Topic(), "partition": partitionConsumer.Partition(), "function": funcName})
 			// Start a separate goroutine per partition to consume messages:
-			partitionLogger.Infof("Started partition-consumer")
 			go createPartitionConsumerProcess(partitionLogger, partitionConsumer, nextThreadId, funcName, ns, clientset, stopchan)
 			nextThreadId++
 
